@@ -10,8 +10,8 @@ android {
         applicationId = "dev.joycon2.bridge"
         minSdk = 31
         targetSdk = 36
-        versionCode = 15
-        versionName = "1.4.2"
+        versionCode = 16
+        versionName = "1.4.3"
 
         ndk {
             abiFilters += listOf("arm64-v8a")

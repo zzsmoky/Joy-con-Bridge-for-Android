@@ -20,12 +20,8 @@ import java.util.Set;
 @SuppressLint("PrivateApi")
 public final class ShizukuInputService extends IInputInjectionService.Stub {
     private static final String FF_LOG_TAG = "JoyConBridgeFF";
-    private static final String AXIS_LOG_TAG = "JoyConBridgeAxis";
     private static final long DEVICE_REGISTRATION_TIMEOUT_MS = 5_000L;
     private static final long PARTIAL_PAIR_RESCAN_MS = 1_500L;
-    private static final long WAKE_STABILIZATION_MS = 650L;
-    private static final long TOPOLOGY_RESCAN_DELAY_MS = 650L;
-    private static final long AXIS_RECOVERY_DELAY_MS = 900L;
     private static final int READ_TIMEOUT_MS = 200;
     private static final int BOTH_DEVICES = JoyConEvdevMapper.SIDE_LEFT
             | JoyConEvdevMapper.SIDE_RIGHT;
@@ -51,8 +47,6 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
     private volatile String status = "Native dual controllers; checking Joy-Cons";
     private volatile String deviceDescription = "";
     private volatile String rumbleStatus = "";
-    private volatile String axisDiagnostics = "";
-    private volatile boolean autoAxisRecoveryArmed = true;
 
     private Thread inputThread;
     private Thread combinedRumbleThread;
@@ -108,14 +102,7 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
 
     @Override
     public synchronized String setBridgeMode(int modeCode) {
-        return setBridgeModeInternal(modeCode, false);
-    }
-
-    private String setBridgeModeInternal(int modeCode, boolean automaticRecovery) {
         BridgeMode mode = BridgeMode.fromCode(modeCode);
-        if (!automaticRecovery) {
-            autoAxisRecoveryArmed = true;
-        }
         stopCurrentSession();
         reportCount = 0L;
         activeMode = BridgeMode.NATIVE_DUAL.code();
@@ -167,7 +154,6 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
         String runtimeRumbleError = controller == null ? "" : controller.status();
         return status
                 + (deviceDescription.isEmpty() ? "" : "\n" + deviceDescription)
-                + (axisDiagnostics.isEmpty() ? "" : "\n" + axisDiagnostics)
                 + (rumbleStatus.isEmpty() ? "" : "\n" + rumbleStatus)
                 + (runtimeRumbleError.isEmpty() ? "" : "\n" + runtimeRumbleError);
     }
@@ -227,7 +213,6 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
 
     @Override
     public synchronized void stopBridge() {
-        autoAxisRecoveryArmed = true;
         stopCurrentSession();
         activeMode = BridgeMode.NATIVE_DUAL.code();
         refreshNativeStatus();
@@ -242,21 +227,7 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
     private void runInputLoop(BridgeMode mode, long generation) {
         JoyConEvdevMapper mapper = new JoyConEvdevMapper();
         long appliedMappingRevision = mappingRevision;
-        int lastObservedMask = 0;
         while (isSessionActive(mode, generation)) {
-            RightStickAxisMonitor rightAxisMonitor = new RightStickAxisMonitor();
-            int scannedMask = nativeScanMask();
-            int newlyAvailableSides = scannedMask & ~lastObservedMask;
-            lastObservedMask = scannedMask;
-            if (newlyAvailableSides != 0) {
-                status = mode.label() + "; newly available Joy-Con detected; "
-                        + "waiting for wake stabilization";
-                axisDiagnostics = "Raw axis waiting for wake stabilization";
-                sleepQuietly(WAKE_STABILIZATION_MS);
-                if (!isSessionActive(mode, generation)) {
-                    break;
-                }
-            }
             long handle = nativeOpenJoyCons(true);
             if (handle == 0L) {
                 if (!isSessionActive(mode, generation)) {
@@ -265,9 +236,6 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
                 deviceMask = 0;
                 grabbed = false;
                 deviceDescription = "";
-                if (scannedMask == 0) {
-                    lastObservedMask = 0;
-                }
                 status = mode.label() + "; " + nativeLastError() + "; retrying in 1 second";
                 sleepQuietly(1_000L);
                 continue;
@@ -289,13 +257,7 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
                 controller.updateDevices(nativeUniqueIds(handle));
             }
             mapper.reset();
-            initializeMapper(
-                    handle,
-                    openedMask,
-                    mapper,
-                    rightAxisMonitor,
-                    SystemClock.uptimeMillis()
-            );
+            initializeMapper(handle, openedMask, mapper);
             try {
                 long targetMappingRevision = mappingRevision;
                 sendMappedReports(mode, mapper, 0);
@@ -310,23 +272,12 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
             long partialDeadline = SystemClock.uptimeMillis() + PARTIAL_PAIR_RESCAN_MS;
             int[] event = new int[4];
             int dirtyMask = 0;
-            String recoveryReason = null;
             while (isSessionActive(mode, generation)) {
                 int result = nativeReadEvent(handle, event, READ_TIMEOUT_MS);
                 if (result < 0) {
-                    lastObservedMask = 0;
-                    status = mode.label() + "; physical Joy-Con node changed; releasing and rescanning";
-                    axisDiagnostics = appendDiagnosticState(
-                            rightAxisMonitor,
-                            "topology-rescan"
-                    );
                     break;
                 }
                 if (result == 0) {
-                    if (requestRightAxisRecoveryIfNeeded(rightAxisMonitor)) {
-                        recoveryReason = "right ABS_RX remained one-sided after wake";
-                        break;
-                    }
                     if (appliedMappingRevision != mappingRevision) {
                         try {
                             long targetMappingRevision = mappingRevision;
@@ -352,12 +303,6 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
                 int value = event[3];
                 if (type == JoyConEvdevMapper.EV_SYN
                         && code == JoyConEvdevMapper.SYN_DROPPED) {
-                    status = mode.label() + "; physical Joy-Con event stream dropped; "
-                            + "releasing and rescanning";
-                    axisDiagnostics = appendDiagnosticState(
-                            rightAxisMonitor,
-                            "syn-dropped-rescan"
-                    );
                     break;
                 }
                 if (type == JoyConEvdevMapper.EV_SYN
@@ -380,33 +325,15 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
                     if (mapper.applyEvent(side, type, code, value)) {
                         dirtyMask |= side;
                     }
-                    if (side == JoyConEvdevMapper.SIDE_RIGHT
-                            && type == JoyConEvdevMapper.EV_ABS
-                            && code == JoyConEvdevMapper.ABS_RX) {
-                        rightAxisMonitor.record(value, SystemClock.uptimeMillis());
-                        if (requestRightAxisRecoveryIfNeeded(rightAxisMonitor)) {
-                            recoveryReason = "right ABS_RX remained one-sided after wake";
-                            break;
-                        }
-                    }
                 }
             }
 
             nativeCloseJoyCons(handle);
             deviceMask = 0;
             grabbed = false;
-            if (recoveryReason != null && isSessionActive(mode, generation)) {
-                String diagnostic = rightAxisMonitor.summary();
-                status = mode.label() + "; " + recoveryReason
-                        + "; physical input released; rebuilding bridge session";
-                axisDiagnostics = diagnostic;
-                Log.w(AXIS_LOG_TAG, recoveryReason + "; " + diagnostic);
-                scheduleAxisSessionRecovery(mode, generation, recoveryReason);
-                return;
-            }
             if (isSessionActive(mode, generation)) {
                 status = mode.label() + "; Joy-Con topology changed; rescanning";
-                sleepQuietly(TOPOLOGY_RESCAN_DELAY_MS);
+                sleepQuietly(300L);
             }
         }
         if (generation == sessionGeneration) {
@@ -415,53 +342,10 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
         }
     }
 
-    private boolean requestRightAxisRecoveryIfNeeded(RightStickAxisMonitor monitor) {
-        axisDiagnostics = monitor.summary();
-        if (monitor.hasPositiveExcursion()) {
-            autoAxisRecoveryArmed = true;
-            return false;
-        }
-        if (!autoAxisRecoveryArmed || !monitor.shouldRecover(SystemClock.uptimeMillis())) {
-            return false;
-        }
-        autoAxisRecoveryArmed = false;
-        monitor.markRecoveryRequested();
-        axisDiagnostics = monitor.summary();
-        return true;
-    }
-
-    private void scheduleAxisSessionRecovery(
-            BridgeMode mode,
-            long generation,
-            String reason
-    ) {
-        Thread recoveryThread = new Thread(() -> {
-            sleepQuietly(AXIS_RECOVERY_DELAY_MS);
-            synchronized (ShizukuInputService.this) {
-                if (!isSessionActive(mode, generation)) {
-                    return;
-                }
-                Log.i(AXIS_LOG_TAG, "Rebuilding bridge session after " + reason);
-                setBridgeModeInternal(mode.code(), true);
-            }
-        }, "joycon-axis-recovery");
-        recoveryThread.setDaemon(true);
-        recoveryThread.start();
-    }
-
-    private static String appendDiagnosticState(
-            RightStickAxisMonitor monitor,
-            String action
-    ) {
-        return monitor.summary() + " action=" + action;
-    }
-
     private void initializeMapper(
             long handle,
             int mask,
-            JoyConEvdevMapper mapper,
-            RightStickAxisMonitor rightAxisMonitor,
-            long nowMs
+            JoyConEvdevMapper mapper
     ) {
         if ((mask & JoyConEvdevMapper.SIDE_LEFT) != 0) {
             initializeAxis(handle, JoyConEvdevMapper.SIDE_LEFT, JoyConEvdevMapper.ABS_X, mapper);
@@ -469,37 +353,17 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
             initializeKeys(handle, JoyConEvdevMapper.SIDE_LEFT, mapper);
         }
         if ((mask & JoyConEvdevMapper.SIDE_RIGHT) != 0) {
-            int[] rightX = initializeAxis(
-                    handle,
-                    JoyConEvdevMapper.SIDE_RIGHT,
-                    JoyConEvdevMapper.ABS_RX,
-                    mapper
-            );
-            if (rightX != null) {
-                rightAxisMonitor.configure(
-                        rightX[0],
-                        rightX[1],
-                        rightX[2],
-                        nowMs
-                );
-                axisDiagnostics = rightAxisMonitor.summary();
-            } else {
-                axisDiagnostics = "Raw axis R.ABS_RX unavailable";
-            }
+            initializeAxis(handle, JoyConEvdevMapper.SIDE_RIGHT, JoyConEvdevMapper.ABS_RX, mapper);
             initializeAxis(handle, JoyConEvdevMapper.SIDE_RIGHT, JoyConEvdevMapper.ABS_RY, mapper);
             initializeKeys(handle, JoyConEvdevMapper.SIDE_RIGHT, mapper);
-        } else {
-            axisDiagnostics = "";
         }
     }
 
-    private int[] initializeAxis(long handle, int side, int code, JoyConEvdevMapper mapper) {
+    private void initializeAxis(long handle, int side, int code, JoyConEvdevMapper mapper) {
         int[] info = new int[4];
         if (nativeGetAbsInfo(handle, side, code, info) != 0) {
             mapper.setAxis(side, code, info[0], info[1], info[2], info[3]);
-            return info;
         }
-        return null;
     }
 
     private void initializeKeys(long handle, int side, JoyConEvdevMapper mapper) {
@@ -706,7 +570,6 @@ public final class ShizukuInputService extends IInputInjectionService.Stub {
         deviceMask = 0;
         stopVirtualDevices();
         rumbleStatus = "";
-        axisDiagnostics = "";
     }
 
     private void stopVirtualDevices() {
