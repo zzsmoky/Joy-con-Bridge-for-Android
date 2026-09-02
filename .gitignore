@@ -1,0 +1,12 @@
+.gradle/
+.gradle-user/
+.idea/
+local.properties
+**/build/
+*.iml
+*.apk
+*.aab
+captures/
+downloads/
+local-maven/
+tools/

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="48dp"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingHorizontal="4dp">
+
+    <TextView
+        android:id="@+id/notification_mode"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/notification_state"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_weight="0"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/notification_compat"
+        style="@style/NotificationAction" />
+
+    <TextView
+        android:id="@+id/notification_combined"
+        style="@style/NotificationAction" />
+
+    <TextView
+        android:id="@+id/notification_native"
+        style="@style/NotificationAction" />
+
+    <TextView
+        android:id="@+id/notification_stop"
+        style="@style/NotificationStopAction" />
+</LinearLayout>
